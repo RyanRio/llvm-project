@@ -97,10 +97,18 @@ auto inst_counter_types(InstCounterType MaxCounter = NUM_INST_CNTS) {
   return enum_seq(LOAD_CNT, MaxCounter);
 }
 
+// All regunits for a particular MCRegister are contiguous, so we don't need the
+// actual MCRegUnit.
+using RegUnit = unsigned;
+
+/// Represents a contiguous interval of register units [First, Last]
+/// This is only valid for targets where RegistersAreIntervals is enabled.
+using RegUnitInterval = std::pair<unsigned, unsigned>;
+
 /// Integer IDs used to track vector memory locations we may have to wait on.
 /// Encoded as u16 chunks:
 ///
-///   [0,               REGUNITS_END ): MCRegUnit
+///   [0,               REGUNITS_END ): RegUnit
 ///   [LDSDMA_BEGIN,    LDSDMA_END  ) : LDS DMA IDs
 ///
 /// NOTE: The choice of encoding these as "u16 chunks" is arbitrary.
@@ -115,7 +123,7 @@ enum : VMEMID {
   TRACKINGID_RANGE_LEN = (1 << 16),
 
   // Important: MCRegUnits must always be tracked starting from 0, as we
-  // need to be able to convert between a MCRegUnit and a VMEMID freely.
+  // need to be able to convert between a RegUnit and a VMEMID freely.
   REGUNITS_BEGIN = 0,
   REGUNITS_END = REGUNITS_BEGIN + TRACKINGID_RANGE_LEN,
 
@@ -126,11 +134,6 @@ enum : VMEMID {
   LDSDMA_BEGIN = REGUNITS_END,
   LDSDMA_END = LDSDMA_BEGIN + NUM_LDSDMA,
 };
-
-/// Convert a MCRegUnit to a VMEMID.
-static constexpr VMEMID toVMEMID(MCRegUnit RU) {
-  return static_cast<unsigned>(RU);
-}
 
 struct HardwareLimits {
   unsigned LoadcntMax; // Corresponds to VMcnt prior to gfx12.
@@ -667,7 +670,7 @@ public:
     return getScoreUB(T) - getScoreLB(T);
   }
 
-  unsigned getSGPRScore(MCRegUnit RU, InstCounterType T) const {
+  unsigned getSGPRScore(RegUnit RU, InstCounterType T) const {
     auto It = SGPRs.find(RU);
     return It != SGPRs.end() ? It->second.Scores[getSgprScoresIdx(T)] : 0;
   }
@@ -742,8 +745,9 @@ public:
   // Return true if there might be pending writes to the vgpr-interval by VMEM
   // instructions with types different from V.
   bool hasOtherPendingVmemTypes(MCPhysReg Reg, VmemType V) const {
-    for (MCRegUnit RU : regunits(Reg)) {
-      auto It = VMem.find(toVMEMID(RU));
+    RegUnitInterval Interval = regunits(Reg);
+    for (unsigned RU = Interval.first; RU <= Interval.second; ++RU) {
+      auto It = VMem.find(RU);
       if (It != VMem.end() && (It->second.VMEMTypes & ~(1 << V)))
         return true;
     }
@@ -751,8 +755,9 @@ public:
   }
 
   void clearVgprVmemTypes(MCPhysReg Reg) {
-    for (MCRegUnit RU : regunits(Reg)) {
-      if (auto It = VMem.find(toVMEMID(RU)); It != VMem.end()) {
+    RegUnitInterval Interval = regunits(Reg);
+    for (unsigned RU = Interval.first; RU <= Interval.second; ++RU) {
+      if (auto It = VMem.find(RU); It != VMem.end()) {
         It->second.VMEMTypes = 0;
         if (It->second.empty())
           VMem.erase(It);
@@ -798,7 +803,7 @@ private:
       const MergeInfo MergeInfos[NUM_INST_CNTS],
       const SmallVectorImpl<std::array<unsigned, NUM_INST_CNTS>> &OtherMarkers);
 
-  iterator_range<MCRegUnitIterator> regunits(MCPhysReg Reg) const {
+  RegUnitInterval regunits(MCPhysReg Reg) const {
     assert(Reg != AMDGPU::SCC && "Shouldn't be used on SCC");
     if (!Context->TRI->isInAllocatableClass(Reg))
       return {{}, {}};
@@ -806,7 +811,7 @@ private:
     unsigned Size = Context->TRI->getRegSizeInBits(*RC);
     if (Size == 16 && Context->ST->hasD16Writes32BitVgpr())
       Reg = Context->TRI->get32BitRegister(Reg);
-    return Context->TRI->regunits(Reg);
+    return Context->TRI->getRegUnitInterval(Reg);
   }
 
   void setScoreLB(InstCounterType T, unsigned Val) {
@@ -830,11 +835,13 @@ private:
     if (Reg == AMDGPU::SCC) {
       SCCScore = Val;
     } else if (TRI->isVectorRegister(*Context->MRI, Reg)) {
-      for (MCRegUnit RU : regunits(Reg))
-        VMem[toVMEMID(RU)].Scores[T] = Val;
+      RegUnitInterval Interval = regunits(Reg);
+      for (unsigned RU = Interval.first; RU <= Interval.second; ++RU)
+        VMem[RU].Scores[T] = Val;
     } else if (TRI->isSGPRReg(*Context->MRI, Reg)) {
       auto STy = getSgprScoresIdx(T);
-      for (MCRegUnit RU : regunits(Reg))
+      RegUnitInterval Interval = regunits(Reg);
+      for (unsigned RU = Interval.first; RU <= Interval.second; ++RU)
         SGPRs[RU].Scores[STy] = Val;
     } else {
       llvm_unreachable("Register cannot be tracked/unknown register!");
@@ -893,7 +900,7 @@ private:
   };
 
   DenseMap<VMEMID, VMEMInfo> VMem; // VGPR + LDS DMA
-  DenseMap<MCRegUnit, SGPRInfo> SGPRs;
+  DenseMap<RegUnit, SGPRInfo> SGPRs;
 
   // Reg score for SCC.
   unsigned SCCScore = 0;
@@ -1092,8 +1099,9 @@ void WaitcntBrackets::updateByEvent(WaitEventType E, MachineInstr &Inst) {
           // this with another potential dependency
           if (hasPointSampleAccel(Inst))
             TypesMask |= 1 << VMEM_NOSAMPLER;
-          for (MCRegUnit RU : regunits(Op.getReg().asMCReg()))
-            VMem[toVMEMID(RU)].VMEMTypes |= TypesMask;
+          RegUnitInterval Interval = regunits(Op.getReg().asMCReg());
+          for (unsigned RU = Interval.first; RU <= Interval.second; ++RU)
+            VMem[RU].VMEMTypes |= TypesMask;
         }
       }
       setScoreByOperand(Op, T, CurrScore);
@@ -1231,7 +1239,7 @@ void WaitcntBrackets::print(raw_ostream &OS) const {
 
       // Also need to print sgpr scores for lgkm_cnt or xcnt.
       if (isSmemCounter(T)) {
-        SmallVector<MCRegUnit> SortedSMEMIDs(SGPRs.keys());
+        SmallVector<RegUnit> SortedSMEMIDs(SGPRs.keys());
         sort(SortedSMEMIDs);
         for (auto ID : SortedSMEMIDs) {
           unsigned RegScore = SGPRs.at(ID).Scores[getSgprScoresIdx(T)];
@@ -1427,10 +1435,10 @@ void WaitcntBrackets::determineWaitForPhysReg(InstCounterType T, MCPhysReg Reg,
     determineWaitForScore(T, SCCScore, Wait);
   } else {
     bool IsVGPR = Context->TRI->isVectorRegister(*Context->MRI, Reg);
-    for (MCRegUnit RU : regunits(Reg))
+    RegUnitInterval Interval = regunits(Reg);
+    for (unsigned RU = Interval.first; RU <= Interval.second; ++RU)
       determineWaitForScore(
-          T, IsVGPR ? getVMemScore(toVMEMID(RU), T) : getSGPRScore(RU, T),
-          Wait);
+          T, IsVGPR ? getVMemScore(RU, T) : getSGPRScore(RU, T), Wait);
   }
 }
 
@@ -2970,8 +2978,8 @@ bool SIInsertWaitcnts::shouldFlushVmCnt(MachineLoop *ML,
   bool HasVMemLoad = false;
   bool HasVMemStore = false;
   bool UsesVgprLoadedOutside = false;
-  DenseSet<MCRegUnit> VgprUse;
-  DenseSet<MCRegUnit> VgprDef;
+  DenseSet<RegUnit> VgprUse;
+  DenseSet<RegUnit> VgprDef;
 
   for (MachineBasicBlock *MBB : ML->blocks()) {
     for (MachineInstr &MI : *MBB) {
@@ -2984,7 +2992,9 @@ bool SIInsertWaitcnts::shouldFlushVmCnt(MachineLoop *ML,
         if (Op.isDebug() || !TRI->isVectorRegister(*MRI, Op.getReg()))
           continue;
         // Vgpr use
-        for (MCRegUnit RU : TRI->regunits(Op.getReg().asMCReg())) {
+        RegUnitInterval Interval =
+            TRI->getRegUnitInterval(Op.getReg().asMCReg());
+        for (unsigned RU = Interval.first; RU <= Interval.second; ++RU) {
           // If we find a register that is loaded inside the loop, 1. and 2.
           // are invalidated and we can exit.
           if (VgprDef.contains(RU))
@@ -2992,12 +3002,11 @@ bool SIInsertWaitcnts::shouldFlushVmCnt(MachineLoop *ML,
           VgprUse.insert(RU);
           // If at least one of Op's registers is in the score brackets, the
           // value is likely loaded outside of the loop.
-          VMEMID ID = toVMEMID(RU);
-          if (Brackets.getVMemScore(ID, LOAD_CNT) >
+          if (Brackets.getVMemScore(RU, LOAD_CNT) >
                   Brackets.getScoreLB(LOAD_CNT) ||
-              Brackets.getVMemScore(ID, SAMPLE_CNT) >
+              Brackets.getVMemScore(RU, SAMPLE_CNT) >
                   Brackets.getScoreLB(SAMPLE_CNT) ||
-              Brackets.getVMemScore(ID, BVH_CNT) >
+              Brackets.getVMemScore(RU, BVH_CNT) >
                   Brackets.getScoreLB(BVH_CNT)) {
             UsesVgprLoadedOutside = true;
             break;
@@ -3008,7 +3017,9 @@ bool SIInsertWaitcnts::shouldFlushVmCnt(MachineLoop *ML,
       // VMem load vgpr def
       if (isVMEMOrFlatVMEM(MI) && MI.mayLoad()) {
         for (const MachineOperand &Op : MI.all_defs()) {
-          for (MCRegUnit RU : TRI->regunits(Op.getReg().asMCReg())) {
+          RegUnitInterval Interval =
+              TRI->getRegUnitInterval(Op.getReg().asMCReg());
+          for (unsigned RU = Interval.first; RU <= Interval.second; ++RU) {
             // If we find a register that is loaded inside the loop, 1. and 2.
             // are invalidated and we can exit.
             if (VgprUse.contains(RU))

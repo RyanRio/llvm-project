@@ -1929,6 +1929,123 @@ void CodeGenRegBank::computeRegUnitWeights() {
   }
 }
 
+// Enforce that all registers are intervals of regunits if the target
+// requests this property. This will renumber regunits to ensure the
+// interval property holds, or error out if it cannot be satisfied.
+void CodeGenRegBank::enforceRegUnitIntervals() {
+  // Find the target record (there should be exactly one)
+  std::vector<const Record *> Targets =
+      Records.getAllDerivedDefinitions("Target");
+
+  if (Targets.empty())
+    return; // No target defined
+
+  if (Targets.size() > 1)
+    PrintFatalError("Multiple Target records defined");
+
+  const Record *Target = Targets[0];
+  if (!Target->getValueAsBit("RegistersAreIntervals"))
+    return;
+
+  LLVM_DEBUG(dbgs() << "Enforcing regunit intervals for target\n");
+
+  // Build a map from old regunit numbers to new regunit numbers
+  // RegUnitRenumbering[x] = y means regunit x is renumbered to
+  // RegUnitRenumbering[y], stopping at ~0u.
+  std::vector<unsigned> RegUnitRenumbering(RegUnits.size(), ~0u);
+
+  // RegUnits that have been renumbered from X -> Y. Y is what is marked so that
+  // it doesn't create a chain of swaps.
+  SparseBitVector DontRenumberUnits;
+
+  std::function<unsigned(unsigned)> GetRenumberedUnit =
+      [&](unsigned NewUnit) -> unsigned {
+    if (RegUnitRenumbering[NewUnit] == ~0u)
+      return NewUnit;
+    else
+      return RegUnitRenumbering[NewUnit];
+  };
+
+  std::function<void(unsigned, unsigned)> UpdateRenumbering =
+      [&](unsigned PrevUnit, unsigned NewUnit) {
+        RegUnitRenumbering[NewUnit] = PrevUnit;
+        RegUnitRenumbering[PrevUnit] = NewUnit;
+        DontRenumberUnits.set(NewUnit);
+      };
+
+  std::function<unsigned(unsigned)> GetFinalRegUnit =
+      [&](unsigned CurrUnit) -> unsigned {
+    if (RegUnitRenumbering[CurrUnit] != ~0u)
+      return RegUnitRenumbering[CurrUnit];
+    return CurrUnit;
+  };
+
+  std::function<bool(CodeGenRegister::RegUnitList &)> IsContiguous =
+      [&](CodeGenRegister::RegUnitList &Units) -> bool {
+    unsigned LastUnit = Units.find_first();
+    for (auto ThisUnit : llvm::make_range(++Units.begin(), Units.end())) {
+      if (ThisUnit != LastUnit + 1)
+        return false;
+      LastUnit = ThisUnit;
+    }
+    return true;
+  };
+
+  // Process registers in definition order
+  for (CodeGenRegister &Reg : Registers) {
+    LLVM_DEBUG(dbgs() << "Processing register " << Reg.getName() << "\n");
+    const auto &Units = Reg.getNativeRegUnits();
+    if (Units.empty())
+      continue;
+    SparseBitVector RenumberedUnits;
+    // First renumber all the units for this register according to previous
+    // renumbering.
+    LLVM_DEBUG(dbgs() << "  Original (Renumbered) units:");
+    for (unsigned U : Units) {
+      LLVM_DEBUG(dbgs() << " " << U << "(" << GetRenumberedUnit(U) << "), ");
+      RenumberedUnits.set(GetRenumberedUnit(U));
+    }
+    LLVM_DEBUG(dbgs() << "\n");
+
+    unsigned LastUnit = RenumberedUnits.find_first();
+    for (auto ThisUnit :
+         llvm::make_range(++RenumberedUnits.begin(), RenumberedUnits.end())) {
+      if (ThisUnit != LastUnit + 1) {
+        if (DontRenumberUnits.test(LastUnit + 1)) {
+          LLVM_DEBUG(dbgs() << "  Cannot renumber unit " << LastUnit + 1
+                            << " because it is already a renumbered unit\n");
+          reportFatalInternalError("Cannot enforce regunit intervals, greedy "
+                                   "swapping of regunits failed.");
+        }
+        LLVM_DEBUG(dbgs() << "  Renumbering unit " << ThisUnit << " to "
+                          << (LastUnit + 1) << "\n");
+        UpdateRenumbering(ThisUnit, LastUnit + 1);
+        ThisUnit = LastUnit + 1;
+      }
+      LastUnit = ThisUnit;
+    }
+  }
+
+  // Apply the renumbering to all registers
+  for (CodeGenRegister &Reg : Registers) {
+    CodeGenRegister::RegUnitList NewRegUnits;
+    for (unsigned OldUnit : Reg.getRegUnits())
+      NewRegUnits.set(GetFinalRegUnit(OldUnit));
+    Reg.setNewRegUnits(NewRegUnits);
+
+    CodeGenRegister::RegUnitList NewNativeUnits;
+    for (unsigned OldUnit : Reg.getNativeRegUnits())
+      NewNativeUnits.set(GetFinalRegUnit(OldUnit));
+    if (!IsContiguous(NewNativeUnits)) {
+      reportFatalInternalError("Cannot enforce regunit intervals, final "
+                               "renumbering did not produce contiguous units "
+                               "for register " +
+                               Reg.getName() + "\n");
+    }
+    Reg.NativeRegUnits = NewNativeUnits;
+  }
+}
+
 // Find a set in UniqueSets with the same elements as Set.
 // Return an iterator into UniqueSets.
 static std::vector<RegUnitSet>::const_iterator
@@ -2207,6 +2324,13 @@ void CodeGenRegBank::computeDerivedInfo() {
   // This may create adopted register units (with unit # >= NumNativeRegUnits).
   Records.getTimer().startTimer("Compute reg unit weights");
   computeRegUnitWeights();
+  Records.getTimer().stopTimer();
+
+  // Enforce regunit intervals if requested by the target.
+  // This must be done after computeRegUnitWeights() but before
+  // computeRegUnitSets().
+  Records.getTimer().startTimer("Enforce regunit intervals");
+  enforceRegUnitIntervals();
   Records.getTimer().stopTimer();
 
   // Compute a unique set of RegUnitSets. One for each RegClass and inferred
